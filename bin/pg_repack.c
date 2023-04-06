@@ -256,6 +256,7 @@ static unsigned int		temp_obj_num = 0; /* temporary objects counter */
 static bool				no_kill_backend = false; /* abandon when timed-out */
 static bool				no_superuser_check = false;
 static SimpleStringList	exclude_extension_list = {NULL, NULL}; /* don't repack tables of these extensions */
+static bool 			error_on_invalid_index = false; /* don't repack when invalid index is found */
 
 /* buffer should have at least 11 bytes */
 static char *
@@ -285,6 +286,7 @@ static pgut_option options[] =
 	{ 'b', 'D', "no-kill-backend", &no_kill_backend },
 	{ 'b', 'k', "no-superuser-check", &no_superuser_check },
 	{ 'l', 'C', "exclude-extension", &exclude_extension_list },
+	{ 'b', 'F', "error-on-invalid-index", &error_on_invalid_index },
 	{ 0 },
 };
 
@@ -1280,7 +1282,7 @@ repack_one_table(repack_table *table, const char *orderby)
 		return;
 
 	/* push repack_cleanup_callback() on stack to clean temporary objects */
-	pgut_atexit_push(repack_cleanup_callback, &table->target_oid);
+	pgut_atexit_push(repack_cleanup_callback, table);
 
 	/*
 	 * 1. Setup advisory lock and trigger on main table.
@@ -1310,7 +1312,8 @@ repack_one_table(repack_table *table, const char *orderby)
 	indexparams[1] = moveidx ? tablespace : NULL;
 
 	/* First, just display a warning message for any invalid indexes
-	 * which may be on the table (mostly to match the behavior of 1.1.8).
+	 * which may be on the table (mostly to match the behavior of 1.1.8),
+	 * if --error-on-invalid-index is not set
 	 */
 	indexres = execute(
 		"SELECT pg_get_indexdef(indexrelid)"
@@ -1321,7 +1324,12 @@ repack_one_table(repack_table *table, const char *orderby)
 	{
 		const char *indexdef;
 		indexdef = getstr(indexres, j, 0);
-		elog(WARNING, "skipping invalid index: %s", indexdef);
+		if (error_on_invalid_index) {
+			elog(WARNING, "Invalid index: %s", indexdef);
+			goto cleanup;
+		} else {
+			elog(WARNING, "skipping invalid index: %s", indexdef);
+		}
 	}
 
 	indexres = execute(
@@ -1970,7 +1978,8 @@ lock_exclusive(PGconn *conn, const char *relid, const char *lock_query, bool sta
 void
 repack_cleanup_callback(bool fatal, void *userdata)
 {
-	Oid			target_table = *(Oid *) userdata;
+	repack_table *table = (repack_table *) userdata;
+	Oid			target_table = table->target_oid;
 	const char *params[2];
 	char		buffer[12];
 	char		num_buff[12];
@@ -1985,7 +1994,17 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		 * so just use an unconditional reconnect().
 		 */
 		reconnect(ERROR);
+
+		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
+		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
+		{
+			pgut_rollback(connection);
+			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
+				 table->target_name);
+		}
+
 		command("SELECT repack.repack_drop($1, $2)", 2, params);
+		command("COMMIT", 0, NULL);
 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
 	}
 }
@@ -2015,7 +2034,17 @@ repack_cleanup(bool fatal, const repack_table *table)
 		/* do cleanup */
 		params[0] = utoa(table->target_oid, buffer);
 		params[1] =  utoa(temp_obj_num, num_buff);
+
+		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
+		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
+		{
+			pgut_rollback(connection);
+			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup",
+				 table->target_name);
+		}
+
 		command("SELECT repack.repack_drop($1, $2)", 2, params);
+		command("COMMIT", 0, NULL);
 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
 	}
 }
